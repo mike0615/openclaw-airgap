@@ -1,0 +1,25 @@
+[Unit]
+Description=Mattermost Self-Hosted Chat
+Documentation=https://docs.mattermost.com
+After=network.target postgresql-16.service
+Requires=postgresql-16.service
+
+[Service]
+Type=notify
+User=mattermost
+Group=mattermost
+WorkingDirectory=__MM_HOME__
+
+ExecStart=__MM_HOME__/bin/mattermost
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+LimitNOFILE=65535
+
+StandardOutput=append:/var/log/openclaw/mattermost.log
+StandardError=append:/var/log/openclaw/mattermost-error.log
+
+[Install]
+WantedBy=multi-user.target

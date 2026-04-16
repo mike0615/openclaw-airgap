@@ -1,0 +1,88 @@
+{
+  // ─── OpenClaw Configuration ──────────────────────────────────────────────
+  // Air-gapped deployment – all providers are local.
+  // Variables replaced by install.sh: __MODEL__ __SERVER_HOSTNAME__ __WORKSPACE__
+  // After install, edit this file at: /opt/openclaw/.openclaw/openclaw.json
+
+  // ─── Workspace ────────────────────────────────────────────────────────────
+  "workspace": "__WORKSPACE__",
+
+  // ─── Local LLM via Ollama ─────────────────────────────────────────────────
+  "models": {
+    "providers": {
+      "ollama": {
+        "apiKey": "ollama-local",
+        "baseUrl": "http://127.0.0.1:11434",
+        "api": "ollama"
+      }
+    }
+  },
+
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/__MODEL__",
+        "fallbacks": []
+      },
+      // ─── Heartbeat – runs every 30 minutes, checks for pending tasks ─────
+      "heartbeat": {
+        "every": "30m",
+        "target": "last",
+        "lightContext": true,
+        "activeHours": {
+          "start": "06:00",
+          "end":   "23:00",
+          "tz":    "America/New_York"
+        }
+      }
+    }
+  },
+
+  // ─── Mattermost channel (fill in botToken after Step 13 of install) ───────
+  "channels": {
+    "mattermost": {
+      "enabled": false,
+      "botToken": "PASTE_BOT_TOKEN_HERE",
+      "baseUrl": "http://__SERVER_HOSTNAME__:8065",
+      "dmPolicy": "pairing",
+      "chatmode": "oncall",
+      "replyToMode": "thread",
+      "groupPolicy": "allowlist",
+      "capabilities": ["inlineButtons"],
+      "commands": {
+        "native": true,
+        "nativeSkills": true,
+        "callbackPath": "/api/channels/mattermost/command"
+      },
+      "interactions": {
+        "callbackBaseUrl": "http://__SERVER_HOSTNAME__:18789"
+      }
+    }
+  },
+
+  // ─── Gateway settings ─────────────────────────────────────────────────────
+  "gateway": {
+    "port": 18789,
+    "host": "0.0.0.0",
+    "logLevel": "info"
+  },
+
+  // ─── ClawHub / skill registry – DISABLED for air-gapped ──────────────────
+  "skills": {
+    "clawhub": {
+      "enabled": false
+    },
+    "directory": "__WORKSPACE__/skills"
+  },
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+  "security": {
+    "allowlist": {
+      "enabled": true,
+      "userIds": []
+    },
+    "sandbox": {
+      "enabled": false
+    }
+  }
+}

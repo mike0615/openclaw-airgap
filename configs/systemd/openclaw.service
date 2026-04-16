@@ -1,0 +1,36 @@
+[Unit]
+Description=OpenClaw AI Agent Gateway
+Documentation=https://openclaw.ai/docs
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=__AGENT_USER__
+Group=__AGENT_USER__
+WorkingDirectory=__OC_HOME__
+
+ExecStart=/usr/local/bin/openclaw gateway \
+  --config __OC_CONFIG__/openclaw.json \
+  --port 18789
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=90
+TimeoutStopSec=30
+
+# Environment
+Environment="OLLAMA_API_KEY=ollama-local"
+Environment="HOME=__OC_HOME__"
+Environment="OPENCLAW_CONFIG_DIR=__OC_CONFIG__"
+
+# Logging
+StandardOutput=append:/var/log/openclaw/gateway.log
+StandardError=append:/var/log/openclaw/gateway-error.log
+
+# Security (tighten once working)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

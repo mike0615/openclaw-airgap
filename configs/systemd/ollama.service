@@ -1,0 +1,29 @@
+[Unit]
+Description=Ollama Local LLM Server
+Documentation=https://github.com/ollama/ollama
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+ExecStart=/usr/local/bin/ollama serve
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+
+# Ollama data directory
+Environment="OLLAMA_MODELS=__OLLAMA_HOME__/models"
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+# Uncomment and adjust for GPU:
+# Environment="CUDA_VISIBLE_DEVICES=0"
+# Environment="OLLAMA_NUM_GPU=1"
+
+# Resource limits
+LimitNOFILE=65535
+# Uncomment to limit memory (adjust to your hardware):
+# MemoryMax=24G
+
+[Install]
+WantedBy=multi-user.target

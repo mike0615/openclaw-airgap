@@ -1,0 +1,359 @@
+---
+# =============================================================================
+# OpenClaw Air-Gap Deployment Playbook
+# =============================================================================
+# Usage:
+#   ansible-playbook deploy.yml \
+#     -i "airgap-host.local," \
+#     -e "bundle_src=/tmp/openclaw-airgap-bundle" \
+#     -e "agent_user=openclaw" \
+#     -e "server_hostname=ai.internal" \
+#     -e "llm_model=qwen2.5:14b" \
+#     --ask-become-pass
+#
+# Requirements on control node:
+#   - Ansible 2.14+
+#   - Bundle tarball or extracted directory available
+# =============================================================================
+
+- name: OpenClaw Air-Gap Deployment
+  hosts: all
+  become: true
+  vars:
+    agent_user:      "openclaw"
+    server_hostname: "{{ inventory_hostname }}"
+    llm_model:       "qwen2.5:14b"
+    oc_home:         "/opt/openclaw"
+    oc_config:       "/opt/openclaw/.openclaw"
+    oc_workspace:    "/opt/openclaw/workspace"
+    ollama_home:     "/opt/ollama"
+    mm_home:         "/opt/mattermost"
+    n8n_home:        "/opt/n8n"
+    bundle_src:      "/tmp/openclaw-airgap-bundle"
+    node_version:    "22"
+
+  tasks:
+
+    # ── Preflight ─────────────────────────────────────────────────────────────
+    - name: Verify bundle exists on target
+      stat:
+        path: "{{ bundle_src }}/MANIFEST.txt"
+      register: bundle_check
+      failed_when: not bundle_check.stat.exists
+
+    - name: Print manifest
+      command: cat "{{ bundle_src }}/MANIFEST.txt"
+      register: manifest
+      changed_when: false
+    - debug:
+        var: manifest.stdout_lines
+
+    # ── Local YUM repo ─────────────────────────────────────────────────────────
+    - name: Set up local RPM repo
+      copy:
+        dest: /etc/yum.repos.d/openclaw-local.repo
+        content: |
+          [openclaw-local]
+          name=OpenClaw Local Bundle
+          baseurl=file://{{ bundle_src }}/rpms
+          enabled=1
+          gpgcheck=0
+
+    - name: Install RPM packages
+      dnf:
+        name:
+          - nodejs
+          - git
+          - gcc
+          - gcc-c++
+          - make
+          - python3
+          - python3-pip
+          - python3-devel
+          - postgresql16-server
+          - postgresql16
+          - redis
+          - firewalld
+          - jq
+          - openssl
+        state: present
+        disablerepo: "*"
+        enablerepo: "openclaw-local"
+      ignore_errors: true
+
+    # ── pnpm ──────────────────────────────────────────────────────────────────
+    - name: Install pnpm binary
+      copy:
+        src: "{{ bundle_src }}/binaries/pnpm"
+        dest: /usr/local/bin/pnpm
+        mode: "0755"
+      when: lookup('stat', bundle_src ~ '/binaries/pnpm').exists | default(false)
+
+    # ── System users ──────────────────────────────────────────────────────────
+    - name: Create agent user
+      user:
+        name: "{{ agent_user }}"
+        home: "{{ oc_home }}"
+        shell: /bin/bash
+        system: false
+        create_home: true
+
+    - name: Create ollama user
+      user:
+        name: ollama
+        home: "{{ ollama_home }}"
+        shell: /bin/false
+        system: true
+        create_home: true
+
+    - name: Create mattermost user
+      user:
+        name: mattermost
+        home: "{{ mm_home }}"
+        shell: /bin/false
+        system: true
+        create_home: true
+
+    # ── Directories ───────────────────────────────────────────────────────────
+    - name: Create workspace directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0755"
+      loop:
+        - "{{ oc_config }}"
+        - "{{ oc_workspace }}"
+        - "{{ oc_workspace }}/skills"
+        - "{{ oc_workspace }}/memory"
+        - "{{ oc_workspace }}/tasks"
+        - /var/log/openclaw
+        - /opt/openclaw-modules
+        - /opt/n8n-modules
+
+    # ── OpenClaw ──────────────────────────────────────────────────────────────
+    - name: Extract OpenClaw node_modules
+      unarchive:
+        src: "{{ bundle_src }}/node-packages/openclaw-node_modules.tar.gz"
+        dest: /opt/openclaw-modules
+        remote_src: true
+        creates: /opt/openclaw-modules/node_modules/openclaw
+
+    - name: Create openclaw CLI wrapper
+      copy:
+        dest: /usr/local/bin/openclaw
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          exec node /opt/openclaw-modules/node_modules/.bin/openclaw "$@"
+
+    - name: Deploy openclaw.json config
+      template:
+        src: "{{ bundle_src }}/configs/openclaw.json"
+        dest: "{{ oc_config }}/openclaw.json"
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0640"
+      vars:
+        __MODEL__: "{{ llm_model }}"
+        __SERVER_HOSTNAME__: "{{ server_hostname }}"
+        __WORKSPACE__: "{{ oc_workspace }}"
+
+    - name: Deploy identity files
+      copy:
+        src: "{{ item }}"
+        dest: "{{ oc_workspace }}/{{ item | basename }}"
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0644"
+        force: false    # don't overwrite if already customised
+      with_fileglob:
+        - "{{ bundle_src }}/configs/identity/*.md"
+
+    - name: Deploy HEARTBEAT.md
+      copy:
+        src: "{{ bundle_src }}/configs/HEARTBEAT.md"
+        dest: "{{ oc_workspace }}/HEARTBEAT.md"
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0644"
+        force: false
+
+    # ── Ollama ────────────────────────────────────────────────────────────────
+    - name: Install Ollama binary (tgz)
+      unarchive:
+        src: "{{ bundle_src }}/binaries/ollama-linux-amd64.tgz"
+        dest: /tmp/ollama-extract
+        remote_src: true
+        creates: /tmp/ollama-extract
+      ignore_errors: true
+
+    - name: Install Ollama binary (copy)
+      copy:
+        src: "{{ bundle_src }}/binaries/ollama"
+        dest: /usr/local/bin/ollama
+        mode: "0755"
+        remote_src: true
+      ignore_errors: true
+
+    - name: Restore Ollama models
+      unarchive:
+        src: "{{ bundle_src }}/models/ollama-models.tar.gz"
+        dest: "{{ ollama_home }}"
+        remote_src: true
+        owner: ollama
+        group: ollama
+      ignore_errors: true
+
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    - name: Initialize PostgreSQL
+      command: postgresql16-setup initdb
+      args:
+        creates: "{{ pg_data | default('/var/lib/pgsql/16/data') }}/PG_VERSION"
+
+    - name: Enable & start PostgreSQL
+      systemd:
+        name: postgresql-16
+        enabled: true
+        state: started
+
+    - name: Generate Mattermost DB password
+      set_fact:
+        mm_db_pass: "{{ lookup('password', '/dev/null length=24 chars=ascii_letters,digits') }}"
+
+    - name: Create Mattermost PostgreSQL user
+      become_user: postgres
+      postgresql_user:
+        name: mmuser
+        password: "{{ mm_db_pass }}"
+      ignore_errors: true
+
+    - name: Create Mattermost database
+      become_user: postgres
+      postgresql_db:
+        name: mattermost
+        owner: mmuser
+      ignore_errors: true
+
+    # ── Mattermost ────────────────────────────────────────────────────────────
+    - name: Find Mattermost archive
+      find:
+        paths: "{{ bundle_src }}/mattermost"
+        patterns: "*.tar.gz"
+      register: mm_archive
+
+    - name: Extract Mattermost
+      unarchive:
+        src: "{{ mm_archive.files[0].path }}"
+        dest: "{{ mm_home }}"
+        remote_src: true
+        owner: mattermost
+        group: mattermost
+        extra_opts: ["--strip-components=1"]
+      when: mm_archive.files | length > 0
+
+    - name: Write Mattermost config
+      template:
+        dest: "{{ mm_home }}/config/config.json"
+        owner: mattermost
+        group: mattermost
+        mode: "0640"
+        content: |
+          {
+            "ServiceSettings": {
+              "SiteURL": "http://{{ server_hostname }}:8065",
+              "ListenAddress": ":8065",
+              "EnableBotAccountCreation": true
+            },
+            "SqlSettings": {
+              "DriverName": "postgres",
+              "DataSource": "postgres://mmuser:{{ mm_db_pass }}@localhost:5432/mattermost?sslmode=disable"
+            },
+            "EmailSettings": {
+              "SendEmailNotifications": false,
+              "RequireEmailVerification": false
+            },
+            "LogSettings": {
+              "FileLocation": "/var/log/openclaw/mattermost.log"
+            }
+          }
+      when: mm_archive.files | length > 0
+
+    # ── n8n ───────────────────────────────────────────────────────────────────
+    - name: Extract n8n node_modules
+      unarchive:
+        src: "{{ bundle_src }}/node-packages/n8n-node_modules.tar.gz"
+        dest: /opt/n8n-modules
+        remote_src: true
+        creates: /opt/n8n-modules/node_modules/.bin/n8n
+      ignore_errors: true
+
+    - name: Create n8n CLI wrapper
+      copy:
+        dest: /usr/local/bin/n8n
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          exec node /opt/n8n-modules/node_modules/.bin/n8n "$@"
+      when: lookup('stat', '/opt/n8n-modules/node_modules/.bin/n8n').exists | default(false)
+
+    # ── Whisper ───────────────────────────────────────────────────────────────
+    - name: Install faster-whisper
+      pip:
+        name: faster-whisper
+        extra_args: "--no-index --find-links={{ bundle_src }}/python-wheels/"
+        state: present
+      ignore_errors: true
+
+    # ── Systemd services ──────────────────────────────────────────────────────
+    - name: Deploy systemd service files
+      template:
+        src: "{{ bundle_src }}/configs/systemd/{{ item }}.service"
+        dest: "/etc/systemd/system/{{ item }}.service"
+      vars:
+        __AGENT_USER__: "{{ agent_user }}"
+        __OC_HOME__: "{{ oc_home }}"
+        __OC_CONFIG__: "{{ oc_config }}"
+        __OLLAMA_HOME__: "{{ ollama_home }}"
+        __MM_HOME__: "{{ mm_home }}"
+        __N8N_HOME__: "{{ n8n_home }}"
+      loop: [ollama, openclaw, mattermost, n8n]
+      notify: reload systemd
+
+    - name: Enable and start services
+      systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - ollama
+        - mattermost
+        - n8n
+        - openclaw
+      ignore_errors: true
+
+    # ── Firewall ──────────────────────────────────────────────────────────────
+    - name: Enable firewalld
+      systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Open required ports
+      firewalld:
+        port: "{{ item }}"
+        state: enabled
+        permanent: true
+        immediate: true
+      loop:
+        - "18789/tcp"   # OpenClaw gateway
+        - "8065/tcp"    # Mattermost
+        - "5678/tcp"    # n8n
+        - "3001/tcp"    # Mission Control
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
