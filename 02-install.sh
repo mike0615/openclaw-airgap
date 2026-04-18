@@ -552,7 +552,10 @@ step 12 "Firewall"
 systemctl enable firewalld
 systemctl start  firewalld
 
-firewall-cmd --permanent --add-port=18789/tcp   # OpenClaw gateway
+# OpenClaw gateway (18789) is bound to 127.0.0.1 by default and must NOT be
+# opened to the network.  If you change "host" in openclaw.json to a LAN IP,
+# add a source-restricted rich rule instead of opening the port to everyone.
+# See docs/SECURITY.md for the recommended rich-rule approach.
 firewall-cmd --permanent --add-port=8065/tcp    # Mattermost HTTP
 firewall-cmd --permanent --add-port=5678/tcp    # n8n
 firewall-cmd --permanent --add-port=3001/tcp    # Dashboard

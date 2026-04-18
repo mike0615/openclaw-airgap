@@ -385,6 +385,10 @@
         print("Mattermost config written.")
         PYJSON
       args:
+        # NOTE: `creates` makes this task idempotent on fresh deploys, but it
+        # will NOT re-apply if config.json already exists (e.g. after a hostname
+        # change).  To force a config refresh, delete the file first or use
+        # `--extra-vars "force_mm_config=true"` and remove this guard.
         creates: "{{ mm_home }}/config/config.json"
       when: mm_archive.files | length > 0
       notify: restart mattermost
@@ -484,13 +488,17 @@
         state: started
 
     - name: Open required ports
+      # NOTE: The OpenClaw gateway (18789) is intentionally omitted here.
+      # It binds to 127.0.0.1 by default and should never be exposed to the
+      # network.  If you change gateway.host in openclaw.json to a LAN IP,
+      # add a source-restricted firewalld rich rule instead of opening the
+      # port broadly.  See docs/SECURITY.md for the recommended rich-rule.
       firewalld:
         port: "{{ item }}"
         state: enabled
         permanent: true
         immediate: true
       loop:
-        - "18789/tcp"   # OpenClaw gateway
         - "8065/tcp"    # Mattermost
         - "5678/tcp"    # n8n
         - "3001/tcp"    # Mission Control

@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Lint shell scripts
+        run: |
+          shellcheck \
+            00-validate.sh \
+            01-prepare-bundle.sh \
+            02-install.sh \
+            03-configure-identity.sh \
+            04-health-check.sh
+
+  sanity:
+    name: Sanity checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate JSON configs
+        run: |
+          # Strip JSON5 // comments before parsing
+          python3 - << 'EOF'
+          import json, re, sys, pathlib
+
+          errors = []
+          for p in pathlib.Path("configs").rglob("*.json"):
+              try:
+                  stripped = re.sub(r"//[^\n]*", "", p.read_text())
+                  json.loads(stripped)
+                  print(f"  OK  {p}")
+              except json.JSONDecodeError as e:
+                  errors.append(f"  FAIL {p}: {e}")
+
+          if errors:
+              for e in errors:
+                  print(e, file=sys.stderr)
+              sys.exit(1)
+          EOF
+
+      - name: Check for unresolved install-time placeholders in configs
+        run: |
+          # These placeholders must be substituted by the installer.
+          # They should NOT appear in non-identity template files.
+          EXEMPT_DIRS="configs/identity"
+          BAD=0
+          while IFS= read -r -d '' f; do
+            dir=$(dirname "$f")
+            # Identity templates are allowed to keep placeholders
+            [[ "$dir" == *"configs/identity"* ]] && continue
+            if grep -qP '__[A-Z_]{3,}__' "$f"; then
+              echo "Unexpected placeholder in: $f"
+              grep -nP '__[A-Z_]{3,}__' "$f"
+              BAD=1
+            fi
+          done < <(find configs -name "*.json" -print0)
+          [[ $BAD -eq 0 ]]
+
+      - name: Validate Ansible playbook syntax
+        run: |
+          pip install ansible --quiet
+          ansible-playbook --syntax-check \
+            -i "localhost," \
+            -e "bundle_src=/tmp/bundle" \
+            ansible/deploy.yml
+
+      - name: Check required files exist
+        run: |
+          REQUIRED=(
+            "00-validate.sh"
+            "01-prepare-bundle.sh"
+            "02-install.sh"
+            "03-configure-identity.sh"
+            "04-health-check.sh"
+            "README.md"
+            "configs/openclaw.json"
+            "configs/HEARTBEAT.md"
+            "configs/identity/SOUL.md"
+            "configs/identity/AGENTS.md"
+            "configs/identity/TOOLS.md"
+            "configs/identity/user.md"
+            "configs/identity/memory.md"
+            "configs/tasks/TASK_TEMPLATE.md"
+            "docs/ARCHITECTURE.md"
+            "docs/INSTALL.md"
+            "docs/CONFIGURE.md"
+            "docs/SECURITY.md"
+            "docs/TROUBLESHOOT.md"
+            "docs/ADVANCED.md"
+            "ansible/deploy.yml"
+          )
+          MISSING=0
+          for f in "${REQUIRED[@]}"; do
+            if [[ ! -f "$f" ]]; then
+              echo "Missing required file: $f"
+              MISSING=1
+            fi
+          done
+          [[ $MISSING -eq 0 ]]
+
+      - name: Check gateway port 18789 not opened in firewall by default
+        run: |
+          # The gateway binds to 127.0.0.1 and must not be opened to the network.
+          if grep -n 'add-port=18789' 02-install.sh | grep -v '^[[:space:]]*#'; then
+            echo "ERROR: 02-install.sh opens firewall port 18789 (should not be default)"
+            grep -n 'add-port=18789' 02-install.sh | grep -v '^[[:space:]]*#'
+            exit 1
+          fi
+          if grep -n '"18789/tcp"' ansible/deploy.yml | grep -v '^[[:space:]]*#'; then
+            echo "ERROR: ansible/deploy.yml opens firewall port 18789 (should not be default)"
+            grep -n '"18789/tcp"' ansible/deploy.yml | grep -v '^[[:space:]]*#'
+            exit 1
+          fi
+          echo "OK: port 18789 not opened in default firewall rules"
