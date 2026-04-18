@@ -18,20 +18,54 @@
 
 set -euo pipefail
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+die()  { echo -e "\033[1;31m[✗]\033[0m $*" >&2; exit 1; }
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+usage() {
+  cat << 'USAGE'
+Usage: sudo bash 01-prepare-bundle.sh [OPTIONS]
+
+Build the OpenClaw air-gap bundle on an internet-connected machine.
+
+Options:
+  --model MODEL    LLM model to pull via Ollama (default: qwen2.5:14b)
+                   Options: llama3.1:8b | qwen2.5:14b | llama3.3:70b
+  --help           Show this help message and exit
+
+Examples:
+  sudo bash 01-prepare-bundle.sh
+  sudo bash 01-prepare-bundle.sh --model llama3.1:8b
+  sudo bash 01-prepare-bundle.sh --model llama3.3:70b
+
+Output:
+  /tmp/openclaw-airgap-bundle.tar.gz     (transfer this to the air-gapped machine)
+  /tmp/openclaw-airgap-bundle.tar.gz.sha256
+
+After completion, transfer the .tar.gz and .sha256 files to the target machine.
+USAGE
+  exit 0
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 BUNDLE_DIR="/tmp/openclaw-airgap-bundle"
-MODEL="${1:-qwen2.5:14b}"
-# Strip --model flag if passed
-[[ "$MODEL" == --model=* ]] && MODEL="${MODEL#--model=}"
-[[ "$MODEL" == "--model" ]] && { shift; MODEL="${1:-qwen2.5:14b}"; }
+MODEL="qwen2.5:14b"
 
 NODE_MAJOR="22"
 MATTERMOST_EDITION="enterprise"   # or "team" for free edition
 PNPM_VERSION="9"
 
-log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
-die()  { echo -e "\033[1;31m[✗]\033[0m $*" >&2; exit 1; }
+# ── Parse arguments ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)   usage ;;
+    --model=*)   MODEL="${1#--model=}"; shift ;;
+    --model)     MODEL="${2:-qwen2.5:14b}"; shift 2 ;;
+    *)           die "Unknown argument: $1 (use --help for usage)" ;;
+  esac
+done
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 log "Checking prerequisites..."
@@ -47,7 +81,15 @@ RHEL_VER=$(rpm -E '%{rhel}' 2>/dev/null || echo "0")
 
 log "Bundle dir: $BUNDLE_DIR"
 log "LLM model:  $MODEL"
-rm -rf "$BUNDLE_DIR"
+
+# ── Confirm before wiping ─────────────────────────────────────────────────────
+if [[ -d "$BUNDLE_DIR" ]]; then
+  warn "Bundle directory already exists: $BUNDLE_DIR"
+  warn "Re-running will wipe the previous bundle contents."
+  read -rp "Continue and wipe previous bundle? [y/N] " _CONFIRM
+  [[ "${_CONFIRM,,}" == "y" ]] || { echo "Aborted."; exit 0; }
+  rm -rf "$BUNDLE_DIR"
+fi
 mkdir -p "$BUNDLE_DIR"/{rpms,node-packages,binaries,models,mattermost,python-wheels,configs,scripts}
 
 # ── PHASE 1 – RPM packages ────────────────────────────────────────────────────
@@ -113,6 +155,18 @@ PNPM_STANDALONE_URL="https://github.com/pnpm/pnpm/releases/latest/download/pnpm-
 curl -fsSL "$PNPM_STANDALONE_URL" -o "$BUNDLE_DIR/binaries/pnpm" 2>/dev/null || \
   warn "pnpm standalone download failed – will use npm fallback"
 chmod +x "$BUNDLE_DIR/binaries/pnpm" 2>/dev/null || true
+
+# Verify pnpm binary is a real ELF executable, not a redirect/error page
+if [[ -f "$BUNDLE_DIR/binaries/pnpm" ]]; then
+  PNPM_FILE_TYPE=$(file "$BUNDLE_DIR/binaries/pnpm" 2>/dev/null || echo "unknown")
+  if echo "$PNPM_FILE_TYPE" | grep -q "ELF"; then
+    log "  pnpm binary verified: ELF executable"
+  else
+    warn "  pnpm binary does not appear to be an ELF executable (got: $PNPM_FILE_TYPE)"
+    warn "  Removing bad pnpm binary – npm fallback will be used during install."
+    rm -f "$BUNDLE_DIR/binaries/pnpm"
+  fi
+fi
 
 # Pack OpenClaw with all dependencies
 log "  Packing openclaw npm package..."
@@ -197,6 +251,12 @@ OLLAMA_HOST="http://127.0.0.1:11435" ollama pull "$MODEL" || {
 
 kill $OLLAMA_PID 2>/dev/null || true
 
+# Validate model files were actually pulled
+if ! find "$OLLAMA_HOME/models" -type f 2>/dev/null | grep -q .; then
+  die "Model pull failed — no model files in $OLLAMA_HOME/models. Re-run with internet."
+fi
+log "  Model verified: $(find "$OLLAMA_HOME/models" -type f | wc -l) files"
+
 # Copy model files to bundle
 if [[ -d "$OLLAMA_HOME/models" ]]; then
   log "  Archiving model files..."
@@ -263,6 +323,8 @@ MC_URL="https://github.com/abhi1693/openclaw-mission-control/archive/refs/heads/
 curl -fL "$MC_URL" -o "$BUNDLE_DIR/node-packages/openclaw-mission-control.tar.gz" || \
   warn "Mission Control download failed"
 
+warn "NOTE: Verify Mission Control source has no outbound connections before production use."
+
 # Pre-build if possible
 if [[ -f "$BUNDLE_DIR/node-packages/openclaw-mission-control.tar.gz" ]]; then
   MCWORK=$(mktemp -d)
@@ -311,17 +373,25 @@ BUNDLE_ARCHIVE="/tmp/openclaw-airgap-bundle.tar.gz"
 tar czf "$BUNDLE_ARCHIVE" -C "$(dirname "$BUNDLE_DIR")" "$(basename "$BUNDLE_DIR")"
 BUNDLE_SIZE=$(du -sh "$BUNDLE_ARCHIVE" | cut -f1)
 
+# Generate SHA256 checksum
+sha256sum "$BUNDLE_ARCHIVE" > "${BUNDLE_ARCHIVE}.sha256"
+log "SHA256: $(cat "${BUNDLE_ARCHIVE}.sha256")"
+
+BUNDLE_SHA256=$(awk '{print $1}' "${BUNDLE_ARCHIVE}.sha256")
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo " Bundle complete!"
 echo " Archive:  $BUNDLE_ARCHIVE"
+echo " SHA256:   $BUNDLE_SHA256"
 echo " Size:     $BUNDLE_SIZE"
 echo ""
 echo " Transfer to air-gapped system:"
-echo "   scp $BUNDLE_ARCHIVE user@airgap-host:/tmp/"
-echo "   # or: copy to USB drive"
+echo "   scp $BUNDLE_ARCHIVE ${BUNDLE_ARCHIVE}.sha256 user@airgap-host:/tmp/"
+echo "   # or: copy both files to USB drive"
 echo ""
 echo " On air-gapped system:"
+echo "   sha256sum -c /tmp/openclaw-airgap-bundle.tar.gz.sha256"
 echo "   tar xzf /tmp/openclaw-airgap-bundle.tar.gz -C /tmp/"
 echo "   sudo bash /tmp/openclaw-airgap-bundle/install.sh"
 echo "═══════════════════════════════════════════════════════════════"

@@ -31,6 +31,30 @@
     n8n_home:        "/opt/n8n"
     bundle_src:      "/tmp/openclaw-airgap-bundle"
     node_version:    "22"
+    pg_data:         "/var/lib/pgsql/16/data"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: restart openclaw
+      systemd:
+        name: openclaw
+        state: restarted
+      ignore_errors: true
+
+    - name: restart mattermost
+      systemd:
+        name: mattermost
+        state: restarted
+      ignore_errors: true
+
+    - name: restart n8n
+      systemd:
+        name: n8n
+        state: restarted
+      ignore_errors: true
 
   tasks:
 
@@ -79,15 +103,30 @@
         state: present
         disablerepo: "*"
         enablerepo: "openclaw-local"
-      ignore_errors: true
+
+    - name: Validate Node.js installation
+      command: node --version
+      register: node_version_result
+      changed_when: false
+      failed_when: node_version_result.rc != 0
+
+    - name: Show Node.js version
+      debug:
+        msg: "Node.js {{ node_version_result.stdout }}"
 
     # ── pnpm ──────────────────────────────────────────────────────────────────
+    - name: Check pnpm binary exists and is ELF
+      stat:
+        path: "{{ bundle_src }}/binaries/pnpm"
+      register: pnpm_stat
+
     - name: Install pnpm binary
       copy:
         src: "{{ bundle_src }}/binaries/pnpm"
         dest: /usr/local/bin/pnpm
         mode: "0755"
-      when: lookup('stat', bundle_src ~ '/binaries/pnpm').exists | default(false)
+        remote_src: true
+      when: pnpm_stat.stat.exists
 
     # ── System users ──────────────────────────────────────────────────────────
     - name: Create agent user
@@ -128,9 +167,12 @@
         - "{{ oc_workspace }}/skills"
         - "{{ oc_workspace }}/memory"
         - "{{ oc_workspace }}/tasks"
+        - "{{ oc_workspace }}/voice-inbox"
+        - "{{ oc_home }}/backups"
         - /var/log/openclaw
         - /opt/openclaw-modules
         - /opt/n8n-modules
+        - /etc/openclaw
 
     # ── OpenClaw ──────────────────────────────────────────────────────────────
     - name: Extract OpenClaw node_modules
@@ -149,25 +191,35 @@
           exec node /opt/openclaw-modules/node_modules/.bin/openclaw "$@"
 
     - name: Deploy openclaw.json config
-      template:
-        src: "{{ bundle_src }}/configs/openclaw.json"
+      copy:
         dest: "{{ oc_config }}/openclaw.json"
         owner: "{{ agent_user }}"
         group: "{{ agent_user }}"
         mode: "0640"
-      vars:
-        __MODEL__: "{{ llm_model }}"
-        __SERVER_HOSTNAME__: "{{ server_hostname }}"
-        __WORKSPACE__: "{{ oc_workspace }}"
+        remote_src: true
+        src: "{{ bundle_src }}/configs/openclaw.json"
+      notify: restart openclaw
 
-    - name: Deploy identity files
+    - name: Substitute variables in openclaw.json
+      replace:
+        path: "{{ oc_config }}/openclaw.json"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { regexp: '__SERVER_HOSTNAME__', replace: '{{ server_hostname }}' }
+        - { regexp: '__WORKSPACE__',       replace: '{{ oc_workspace }}' }
+        - { regexp: '__MODEL__',           replace: '{{ llm_model }}' }
+        - { regexp: '"host": "0\.0\.0\.0"', replace: '"host": "127.0.0.1"' }
+      notify: restart openclaw
+
+    - name: Deploy identity files (do not overwrite if customized)
       copy:
         src: "{{ item }}"
         dest: "{{ oc_workspace }}/{{ item | basename }}"
         owner: "{{ agent_user }}"
         group: "{{ agent_user }}"
         mode: "0644"
-        force: false    # don't overwrite if already customised
+        force: false
       with_fileglob:
         - "{{ bundle_src }}/configs/identity/*.md"
 
@@ -181,21 +233,38 @@
         force: false
 
     # ── Ollama ────────────────────────────────────────────────────────────────
-    - name: Install Ollama binary (tgz)
+    - name: Check for Ollama tgz
+      stat:
+        path: "{{ bundle_src }}/binaries/ollama-linux-amd64.tgz"
+      register: ollama_tgz
+
+    - name: Extract Ollama tgz to temp dir
       unarchive:
         src: "{{ bundle_src }}/binaries/ollama-linux-amd64.tgz"
         dest: /tmp/ollama-extract
         remote_src: true
         creates: /tmp/ollama-extract
-      ignore_errors: true
+      when: ollama_tgz.stat.exists
 
-    - name: Install Ollama binary (copy)
+    - name: Install Ollama binary from extracted archive
+      shell: |
+        find /tmp/ollama-extract -name "ollama" -type f -exec install -m 755 {} /usr/local/bin/ollama \; 2>/dev/null | head -1
+      args:
+        creates: /usr/local/bin/ollama
+      when: ollama_tgz.stat.exists
+
+    - name: Check for Ollama single binary
+      stat:
+        path: "{{ bundle_src }}/binaries/ollama"
+      register: ollama_bin
+
+    - name: Install Ollama single binary
       copy:
         src: "{{ bundle_src }}/binaries/ollama"
         dest: /usr/local/bin/ollama
         mode: "0755"
         remote_src: true
-      ignore_errors: true
+      when: ollama_bin.stat.exists and not ollama_tgz.stat.exists
 
     - name: Restore Ollama models
       unarchive:
@@ -204,37 +273,54 @@
         remote_src: true
         owner: ollama
         group: ollama
-      ignore_errors: true
+        creates: "{{ ollama_home }}/models"
 
     # ── PostgreSQL ────────────────────────────────────────────────────────────
     - name: Initialize PostgreSQL
       command: postgresql16-setup initdb
       args:
-        creates: "{{ pg_data | default('/var/lib/pgsql/16/data') }}/PG_VERSION"
+        creates: "{{ pg_data }}/PG_VERSION"
 
-    - name: Enable & start PostgreSQL
+    - name: Enable and start PostgreSQL
       systemd:
         name: postgresql-16
         enabled: true
         state: started
 
+    - name: Wait for PostgreSQL to be ready
+      command: pg_isready
+      register: pg_ready
+      until: pg_ready.rc == 0
+      retries: 30
+      delay: 1
+      changed_when: false
+
     - name: Generate Mattermost DB password
       set_fact:
-        mm_db_pass: "{{ lookup('password', '/dev/null length=24 chars=ascii_letters,digits') }}"
+        mm_db_pass: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Save Mattermost DB credentials
+      copy:
+        dest: /root/.mattermost-db-creds
+        mode: "0600"
+        content: |
+          DB_USER=mmuser
+          DB_PASS={{ mm_db_pass }}
+          DB_NAME=mattermost
 
     - name: Create Mattermost PostgreSQL user
       become_user: postgres
-      postgresql_user:
+      community.postgresql.postgresql_user:
         name: mmuser
         password: "{{ mm_db_pass }}"
-      ignore_errors: true
+      ignore_errors: false
 
     - name: Create Mattermost database
       become_user: postgres
-      postgresql_db:
+      community.postgresql.postgresql_db:
         name: mattermost
         owner: mmuser
-      ignore_errors: true
+      ignore_errors: false
 
     # ── Mattermost ────────────────────────────────────────────────────────────
     - name: Find Mattermost archive
@@ -251,34 +337,57 @@
         owner: mattermost
         group: mattermost
         extra_opts: ["--strip-components=1"]
+        creates: "{{ mm_home }}/bin/mattermost"
       when: mm_archive.files | length > 0
+      notify: restart mattermost
 
-    - name: Write Mattermost config
-      template:
-        dest: "{{ mm_home }}/config/config.json"
-        owner: mattermost
-        group: mattermost
-        mode: "0640"
-        content: |
-          {
-            "ServiceSettings": {
-              "SiteURL": "http://{{ server_hostname }}:8065",
-              "ListenAddress": ":8065",
-              "EnableBotAccountCreation": true
-            },
-            "SqlSettings": {
-              "DriverName": "postgres",
-              "DataSource": "postgres://mmuser:{{ mm_db_pass }}@localhost:5432/mattermost?sslmode=disable"
-            },
-            "EmailSettings": {
-              "SendEmailNotifications": false,
-              "RequireEmailVerification": false
-            },
-            "LogSettings": {
-              "FileLocation": "/var/log/openclaw/mattermost.log"
-            }
+    - name: Write Mattermost config (Python for safe JSON)
+      shell: |
+        python3 - << 'PYJSON'
+        import json
+        cfg = {
+          "ServiceSettings": {
+            "SiteURL": "http://{{ server_hostname }}:8065",
+            "ListenAddress": ":8065",
+            "ConnectionSecurity": "",
+            "EnableBotAccountCreation": True,
+            "EnableAPIv3": False
+          },
+          "SqlSettings": {
+            "DriverName": "postgres",
+            "DataSource": "postgres://mmuser:{{ mm_db_pass }}@localhost:5432/mattermost?sslmode=disable",
+            "MaxIdleConns": 10,
+            "MaxOpenConns": 100,
+            "Trace": False
+          },
+          "TeamSettings": {
+            "SiteName": "OpenClaw AI",
+            "MaxUsersPerTeam": 50,
+            "EnableTeamCreation": False,
+            "EnableUserCreation": True
+          },
+          "EmailSettings": {
+            "SendEmailNotifications": False,
+            "EnableSignUpWithEmail": True,
+            "RequireEmailVerification": False
+          },
+          "FileSettings": {"MaxFileSize": 104857600},
+          "LogSettings": {
+            "EnableConsole": True,
+            "ConsoleLevel": "INFO",
+            "EnableFile": True,
+            "FileLevel": "WARN",
+            "FileLocation": "/var/log/openclaw/mattermost.log"
           }
+        }
+        with open("{{ mm_home }}/config/config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
+        print("Mattermost config written.")
+        PYJSON
+      args:
+        creates: "{{ mm_home }}/config/config.json"
       when: mm_archive.files | length > 0
+      notify: restart mattermost
 
     # ── n8n ───────────────────────────────────────────────────────────────────
     - name: Extract n8n node_modules
@@ -287,7 +396,6 @@
         dest: /opt/n8n-modules
         remote_src: true
         creates: /opt/n8n-modules/node_modules/.bin/n8n
-      ignore_errors: true
 
     - name: Create n8n CLI wrapper
       copy:
@@ -296,7 +404,18 @@
         content: |
           #!/bin/bash
           exec node /opt/n8n-modules/node_modules/.bin/n8n "$@"
-      when: lookup('stat', '/opt/n8n-modules/node_modules/.bin/n8n').exists | default(false)
+
+    - name: Generate n8n password
+      set_fact:
+        n8n_pass: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+
+    - name: Write n8n env file
+      copy:
+        dest: /etc/openclaw/n8n.env
+        mode: "0600"
+        content: |
+          N8N_BASIC_AUTH_PASSWORD={{ n8n_pass }}
+      notify: restart n8n
 
     # ── Whisper ───────────────────────────────────────────────────────────────
     - name: Install faster-whisper
@@ -306,33 +425,56 @@
         state: present
       ignore_errors: true
 
+    # ── logrotate ─────────────────────────────────────────────────────────────
+    - name: Deploy logrotate config
+      copy:
+        src: "{{ bundle_src }}/configs/logrotate/openclaw"
+        dest: /etc/logrotate.d/openclaw
+        mode: "0644"
+        remote_src: true
+      ignore_errors: true
+
     # ── Systemd services ──────────────────────────────────────────────────────
     - name: Deploy systemd service files
-      template:
-        src: "{{ bundle_src }}/configs/systemd/{{ item }}.service"
+      copy:
         dest: "/etc/systemd/system/{{ item }}.service"
-      vars:
-        __AGENT_USER__: "{{ agent_user }}"
-        __OC_HOME__: "{{ oc_home }}"
-        __OC_CONFIG__: "{{ oc_config }}"
-        __OLLAMA_HOME__: "{{ ollama_home }}"
-        __MM_HOME__: "{{ mm_home }}"
-        __N8N_HOME__: "{{ n8n_home }}"
+        remote_src: true
+        src: "{{ bundle_src }}/configs/systemd/{{ item }}.service"
       loop: [ollama, openclaw, mattermost, n8n]
       notify: reload systemd
+
+    - name: Substitute variables in service files
+      replace:
+        path: "/etc/systemd/system/{{ item.svc }}.service"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { svc: ollama,      regexp: '__AGENT_USER__',  replace: '{{ agent_user }}' }
+        - { svc: ollama,      regexp: '__OLLAMA_HOME__', replace: '{{ ollama_home }}' }
+        - { svc: openclaw,    regexp: '__AGENT_USER__',  replace: '{{ agent_user }}' }
+        - { svc: openclaw,    regexp: '__OC_HOME__',     replace: '{{ oc_home }}' }
+        - { svc: openclaw,    regexp: '__OC_CONFIG__',   replace: '{{ oc_config }}' }
+        - { svc: mattermost,  regexp: '__MM_HOME__',     replace: '{{ mm_home }}' }
+        - { svc: n8n,         regexp: '__AGENT_USER__',  replace: '{{ agent_user }}' }
+        - { svc: n8n,         regexp: '__N8N_HOME__',    replace: '{{ n8n_home }}' }
+      notify: reload systemd
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
 
     - name: Enable and start services
       systemd:
         name: "{{ item }}"
         enabled: true
         state: started
-        daemon_reload: true
+        daemon_reload: false
       loop:
+        - postgresql-16
         - ollama
         - mattermost
         - n8n
         - openclaw
-      ignore_errors: true
 
     # ── Firewall ──────────────────────────────────────────────────────────────
     - name: Enable firewalld
@@ -353,7 +495,83 @@
         - "5678/tcp"    # n8n
         - "3001/tcp"    # Mission Control
 
-  handlers:
-    - name: reload systemd
-      systemd:
-        daemon_reload: true
+# ── Verification play ─────────────────────────────────────────────────────────
+- name: Verify OpenClaw Deployment
+  hosts: all
+  become: true
+  tasks:
+
+    - name: Wait for Ollama to respond
+      uri:
+        url: "http://localhost:11434/api/tags"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: ollama_check
+      retries: 12
+      delay: 5
+      until: ollama_check.status == 200
+      changed_when: false
+
+    - name: Wait for Mattermost to respond
+      uri:
+        url: "http://localhost:8065/api/v4/system/ping"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: mm_check
+      retries: 18
+      delay: 5
+      until: mm_check.status == 200
+      changed_when: false
+
+    - name: Wait for n8n to respond
+      uri:
+        url: "http://localhost:5678/healthz"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: n8n_check
+      retries: 12
+      delay: 5
+      until: n8n_check.status == 200
+      changed_when: false
+
+    - name: Wait for OpenClaw to respond
+      uri:
+        url: "http://localhost:18789/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: oc_check
+      retries: 12
+      delay: 5
+      until: oc_check.status == 200
+      changed_when: false
+      ignore_errors: true
+
+    - name: Verify all services are active
+      command: "systemctl is-active {{ item }}"
+      loop:
+        - postgresql-16
+        - ollama
+        - mattermost
+        - n8n
+        - openclaw
+      changed_when: false
+      register: svc_status
+
+    - name: Show service status summary
+      debug:
+        msg: "{{ item.item }}: {{ item.stdout }}"
+      loop: "{{ svc_status.results }}"
+
+    - name: Deployment complete
+      debug:
+        msg:
+          - "OpenClaw deployment complete."
+          - "Mattermost: http://{{ inventory_hostname }}:8065"
+          - "n8n:        http://{{ inventory_hostname }}:5678"
+          - "OpenClaw:   http://{{ inventory_hostname }}:18789"
+          - "n8n password: /etc/openclaw/n8n.env"
+          - "Next: Create Mattermost admin + bot account, then run openclaw-configure-mattermost <TOKEN>"

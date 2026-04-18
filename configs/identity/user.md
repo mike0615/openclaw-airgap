@@ -2,6 +2,8 @@
 
 > Fill this in by having a conversation with your agent or editing directly.
 > The more you put here, the less you repeat yourself.
+>
+> Run `sudo bash 03-configure-identity.sh` to fill this in interactively.
 
 ## Identity
 
@@ -46,3 +48,8 @@
 
 ---
 *Updated: (date)*
+
+## Setup Status
+
+> PLACEHOLDER: Run `sudo bash 03-configure-identity.sh` to personalize this file,
+> or manually replace `__USER_NAME__` and fill in all sections above.

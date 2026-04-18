@@ -1,0 +1,12 @@
+/var/log/openclaw/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    sharedscripts
+    postrotate
+        systemctl kill --kill-who=main --signal=HUP openclaw mattermost n8n 2>/dev/null || true
+    endscript
+}

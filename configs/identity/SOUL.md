@@ -57,3 +57,9 @@ Read them at session start if context is fresh.
 ---
 *Edit this file to change your agent's personality. Keep it under 100 lines —
 it loads on every request.*
+
+## Setup Status
+
+> PLACEHOLDER: Run `sudo bash 03-configure-identity.sh` to personalize this file,
+> or manually replace `__AGENT_NAME__` and `__USER_NAME__` throughout.
+> Also replace `__WORKSPACE__` with your actual workspace path.
