@@ -474,14 +474,36 @@ WSBKP
 fi
 
 cat >> "$HEARTBEAT_FILE" << 'EXAMPLES'
-# ─── Future tasks (uncomment and configure as you build out workflows) ────────
+# ─── Future / opt-in tasks ───────────────────────────────────────────────────
+# Uncomment and configure these after you set up the prerequisite components.
 
+  # ── backup-check ─────────────────────────────────────────────────────────
+  # Prerequisite: configure a system backup job that writes a status line to
+  # /var/log/backup.log (e.g. via cron + rsync/restic/borgbackup).
+  # See docs/ADVANCED.md "Backup and Restore Procedure" for an example script.
+  # - name: backup-check
+  #   interval: 24h
+  #   runAt: "06:00"
+  #   prompt: |
+  #     Check if /var/log/backup.log exists and has an entry from the last 25 hours.
+  #     If found, verify the last line does not contain "ERROR" or "FAILED".
+  #     If no backup log exists, warn: "No backup log found at /var/log/backup.log —
+  #     backup may not be configured."
+  #     If last backup was > 25h ago, send a DM with the time of last successful backup.
+  #     If backup is current and clean, reply HEARTBEAT_OK.
+
+  # ── inbox-triage ─────────────────────────────────────────────────────────
+  # Prerequisite: configure an AgentMail account or a local SMTP relay and
+  # add its connection details to memory.md and openclaw.json.
   # - name: inbox-triage
   #   interval: 30m
   #   prompt: |
   #     Check the agent email inbox via AgentMail or local SMTP for new messages.
   #     Summarize anything actionable in a brief DM. Skip newsletters and FYIs.
 
+  # ── news-brief ────────────────────────────────────────────────────────────
+  # Prerequisite: install the morning-brief skill
+  # (workspace/skills/morning-brief/SKILL.md) and list its sources in TOOLS.md.
   # - name: news-brief
   #   interval: 24h
   #   runAt: "07:30"
@@ -489,6 +511,9 @@ cat >> "$HEARTBEAT_FILE" << 'EXAMPLES'
   #     Using the morning-brief skill, scrape configured sources and send a
   #     morning briefing to the #briefings Mattermost channel.
 
+  # ── trading-monitor ───────────────────────────────────────────────────────
+  # Prerequisite: install the trading-monitor skill and configure brokerage
+  # API access (local proxy or file-based feed) in TOOLS.md.
   # - name: trading-monitor
   #   interval: 6h
   #   activeHours: { start: "09:30", end: "16:00" }
