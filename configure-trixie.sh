@@ -160,7 +160,7 @@ fi
 chmod 640 "$ENV_FILE"
 chown root:"$AGENT_USER" "$ENV_FILE" 2>/dev/null || true
 
-# ── 5. Patch openclaw.json — update active hours + gateway ───────────────────
+# ── 5. Patch openclaw.json — active hours, gateway, Discord channel ──────────
 if [[ -f "$OC_CONFIG" ]]; then
   log "Patching openclaw.json..."
   python3 - << PYCFG
@@ -179,9 +179,23 @@ try:
     # Open gateway to LAN (firewall restricts access)
     cfg.setdefault("gateway", {})["host"] = "0.0.0.0"
 
+    # Discord channel — token sourced from env var DISCORD_BOT_TOKEN
+    discord_token = "${DISCORD_TOKEN}"
+    channels = cfg.setdefault("channels", {})
+    channels["discord"] = {
+        "enabled": bool(discord_token),
+        "token": {"source": "env", "id": "DISCORD_BOT_TOKEN"} if not discord_token
+                 else discord_token,
+        "dmPolicy": "allowlist",
+        "chatmode": "oncall",
+        "replyToMode": "thread",
+    }
+    if discord_token:
+        channels["discord"]["token"] = discord_token
+
     with open("${OC_CONFIG}", "w") as f:
         json.dump(cfg, f, indent=2)
-    print("  openclaw.json patched")
+    print("  openclaw.json patched (Discord channel added)")
 except Exception as e:
     print(f"  Warning: {e}")
 PYCFG
