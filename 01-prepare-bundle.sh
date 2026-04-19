@@ -99,6 +99,15 @@ log "Phase 1: Downloading RPM packages..."
 dnf install -y epel-release dnf-plugins-core 2>/dev/null || true
 dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-9.rpm" 2>/dev/null || true
 
+# PostgreSQL 16 official PGDG repo (not in standard EPEL)
+if ! rpm -q pgdg-redhat-repo &>/dev/null; then
+  dnf install -y \
+    "https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm" \
+    2>/dev/null || warn "PGDG repo install failed – postgresql16 may not bundle"
+fi
+# Disable the built-in postgresql module so PGDG version wins
+dnf -qy module disable postgresql 2>/dev/null || true
+
 # NodeSource repo for Node 22
 curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" | bash - 2>/dev/null || \
   dnf config-manager --add-repo \
